@@ -1,0 +1,159 @@
+name: Production Reusable CI Pipeline
+
+on:
+  workflow_call:
+    inputs:
+      image_name:
+        required: true
+        type: string
+      sonar_project_key:
+        required: true
+        type: string
+      sonar_org:
+        required: true
+        type: string
+        default: "organistation-org"
+      skip_linting:
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write # Required for Azure OIDC Login
+  pull-requests: write
+  security-events: write
+
+jobs:
+  lint-and-review:
+    name: Lint & Dependency Review
+    if: ${{ !inputs.skip_linting }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Dockerfile Lint (Hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          failure-threshold: error
+
+      - name: Dependency Review (PR Only)
+        if: github.event_name == 'pull_request'
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: high
+
+  security-scans:
+    name: Security Analysis (Sonar, Snyk, Trivy)
+    needs: lint-and-review
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Essential for SonarCloud analysis
+
+      # 1. SonarCloud with Quality Gate Enforcement
+      - name: SonarCloud Scan
+        uses: SonarSource/sonarcloud-scan-action@v2.0.2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        with:
+          args: >
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
+            -Dsonar.organization=${{ inputs.sonar_org }}
+
+      # 2. Trivy Filesystem Scan (Secret Detection)
+      - name: Trivy Filesystem Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          hide-progress: false
+          format: 'table'
+          exit-code: '1' # Fail the pipeline if secrets are found
+          severity: 'CRITICAL,HIGH'
+          scanners: 'secret,config'
+
+      # 3. Snyk Python Dependency Scan
+      - name: Snyk Python Scan
+        uses: snyk/actions/python-3.10@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      - name: Notify Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Security Gates Failed - ${{ github.repository }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "The security gates (SonarCloud/Snyk/Trivy) failed for ${{ github.repository }}. Deployment halted."
+
+  build-and-push:
+    name: Build & Push (Azure ACR)
+    needs: security-scans
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure OIDC Login (No static secrets used)
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: ACR Login
+        uses: azure/docker-login@v1
+        with:
+          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+
+      - name: Build & Scan Container Image
+        run: |
+          IMAGE_TAG=${{ github.sha }}
+          IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}:$IMAGE_TAG
+          docker build -t $IMAGE_NAME .
+          
+          # Run Trivy Container Scan before push
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+            aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME
+
+      - name: Push Branch-Specific Tags
+        run: |
+          BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9]/-/g')
+          IMAGE_PATH=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}
+          
+          # Push specific SHA tag
+          docker push $IMAGE_PATH:${{ github.sha }}
+          
+          # Push Branch tag (e.g. develop, feature-xyz)
+          docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:$BRANCH_NAME
+          docker push $IMAGE_PATH:$BRANCH_NAME
+
+      - name: Push Latest (Main Only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          IMAGE_PATH=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}
+          docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:latest
+          docker push $IMAGE_PATH:latest
+
+      - name: Notify Success
+        if: success()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "CI Success - ${{ inputs.image_name }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "Image ${{ inputs.image_name }} successfully pushed to ACR with tag ${{ github.sha }}."
