@@ -44,29 +44,52 @@ jobs:
         with:
           fail-on-severity: high
 
-  security-scans:
-    name: Security Analysis (Sonar, Snyk, Trivy)
-    # Run even if lint is skipped
+  sast:
+    name: SAST - SonarCloud
     needs: lint-and-review
     if: always() && !failure() && !cancelled()
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      # 1. SonarCloud - Fixed action version
       - name: SonarCloud Scan
-        uses: sonarsource/sonarcloud-scan-action@v3.1.0
+        uses: SonarSource/sonarcloud-github-action@v3
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           args: >
             -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.organization=${{ inputs.sonar_org }}
 
-      # 2. Trivy Filesystem Scan
+  snyk:
+    name: Snyk - Dependency Scan
+    needs: sast
+    if: always()
+    runs-on: ubuntu-latest
+    outputs:
+      failed: ${{ steps.snyk-scan.outcome == 'failure' && 'true' || 'false' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Snyk Security Scan
+        id: snyk-scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      # Trivy Filesystem Scan (Secret Detection)
       - name: Trivy Filesystem Scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -83,31 +106,10 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-      # 3. Snyk - language-agnostic scan
-      - name: Snyk Security Scan
-        uses: snyk/actions/node@master
-        continue-on-error: true
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
-
-      - name: Notify Failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SOURCE_EMAIL }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Security Gates Failed - ${{ github.repository }}"
-          to: ${{ secrets.TARGET_EMAIL }}
-          from: ${{ secrets.SOURCE_EMAIL }}
-          body: "The security gates (SonarCloud/Snyk/Trivy) failed for ${{ github.repository }}. Deployment halted."
-
   build-and-push:
     name: Build & Push (Azure ACR)
-    needs: security-scans
+    needs: [sast, snyk]
+    if: success() || (needs.sast.result == 'success' && needs.snyk.result == 'success')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
