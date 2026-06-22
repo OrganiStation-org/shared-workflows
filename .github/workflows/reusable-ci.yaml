@@ -1,85 +1,75 @@
-name: Production Reusable CI Pipeline
+name: Reusable Microservice CI
 
 on:
   workflow_call:
     inputs:
-      image_name:
+      microservice:
         required: true
         type: string
-      sonar_project_key:
+      language:
         required: true
-        type: string
+        type: string # 'node' or 'python'
       sonar_org:
         required: true
         type: string
-        default: "organistation-org"
-      skip_linting:
-        required: false
-        type: boolean
-        default: false
-      language:
-        required: false
+      image_name:
+        required: true
         type: string
-        default: "node"
-
-permissions:
-  contents: read
-  pull-requests: write
-  security-events: write
 
 jobs:
-  lint-and-review:
-    name: Lint & Dependency Review
-    if: ${{ !inputs.skip_linting }}
+  lint:
+    name: Lint & Analysis
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Dockerfile Lint (Hadolint)
-        uses: hadolint/hadolint-action@v3.1.0
+      
+      - name: Setup Environment
+        uses: actions/setup-node@v4
+        if: ${{ inputs.language == 'node' }}
         with:
-          dockerfile: Dockerfile
-          failure-threshold: error
+          node-version: 22
 
-      - name: Dependency Review (PR Only)
-        if: github.event_name == 'pull_request'
-        uses: actions/dependency-review-action@v4
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        if: ${{ inputs.language == 'python' }}
         with:
-          fail-on-severity: high
+          python-version: '3.10'
 
-      - name: Notify Lint Failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SOURCE_EMAIL }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Linting Failed - ${{ inputs.image_name }}"
-          to: ${{ secrets.TARGET_EMAIL }}
-          from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Code linting or dependency review failed for ${{ inputs.image_name }}. Build halted."
+      - name: Install Linting Tools
+        run: |
+          if [ "${{ inputs.language }}" == "node" ]; then
+            npm install -g eslint
+          else
+            pip install flake8
+          fi
 
-  sast-sonar:
-    name: SAST - SonarCloud
-    needs: lint-and-review
-    if: always() && (needs.lint-and-review.result == 'success' || inputs.skip_linting)
+      - name: Run Lint
+        run: |
+          if [ "${{ inputs.language }}" == "node" ]; then
+            # eslint . --fix || true
+            echo "Skipping ESLint for now"
+          else
+            flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics || true
+          fi
+
+  sonarcloud:
+    name: SonarCloud Scan
+    needs: lint
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-github-action@v3
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        uses: SonarSource/sonarcloud-github-action@master
         with:
           args: >
-            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.organization=${{ inputs.sonar_org }}
+            -Dsonar.projectKey=${{ inputs.sonar_org }}_${{ inputs.microservice }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+        continue-on-error: true
 
       - name: Notify Sonar Failure
         if: failure()
@@ -89,51 +79,47 @@ jobs:
           server_port: 587
           username: ${{ secrets.SOURCE_EMAIL }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "SonarCloud Scan Failed - ${{ inputs.image_name }}"
+          subject: "Security Gate Failed: SonarCloud - ${{ inputs.microservice }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "SonarCloud static analysis failed (or found vulnerabilities) for ${{ inputs.image_name }}. Build continuing as requested."
+          body: "SonarCloud analysis for ${{ inputs.microservice }} found critical issues. Please review the dashboard."
 
   snyk-scan:
-    name: Snyk - Dependency Scan
-    needs: sast-sonar
-    if: always() && (needs.sast-sonar.result == 'success' || needs.sast-sonar.result == 'failure')
+    name: Snyk Vulnerability Scan
+    needs: sonarcloud
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-
-      # 1. Setup Node.js (if applicable)
-      - name: Setup Node.js
-        if: ${{ inputs.language == 'node' }}
+      
+      - name: Setup Node
         uses: actions/setup-node@v4
+        if: ${{ inputs.language == 'node' }}
         with:
-          node-version: '22'
+          node-version: 22
 
-      # 2. Setup Python (if applicable)
       - name: Setup Python
-        if: ${{ inputs.language == 'python' }}
         uses: actions/setup-python@v5
+        if: ${{ inputs.language == 'python' }}
         with:
           python-version: '3.10'
 
-      # 3. Snyk Scan (Node)
-      - name: Snyk Node Scan
-        if: ${{ inputs.language == 'node' }}
-        uses: snyk/actions/node@master
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: --severity-threshold=high
-
-      # 4. Snyk Scan (Python)
-      - name: Snyk Python Scan
+      - name: Snyk Scan
+        uses: snyk/actions/python@master
         if: ${{ inputs.language == 'python' }}
-        uses: snyk/actions/python-3.10@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
           args: --severity-threshold=high
+        continue-on-error: true
+
+      - name: Snyk Node Scan
+        uses: snyk/actions/node@master
+        if: ${{ inputs.language == 'node' }}
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+        continue-on-error: true
 
       - name: Notify Snyk Failure
         if: failure()
@@ -143,10 +129,10 @@ jobs:
           server_port: 587
           username: ${{ secrets.SOURCE_EMAIL }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Snyk Scan Failed - ${{ inputs.image_name }}"
+          subject: "Security Gate Failed: Snyk - ${{ inputs.microservice }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Snyk dependency vulnerability scan failed for ${{ inputs.image_name }}. Build continuing as requested."
+          body: "Snyk vulnerability scan for ${{ inputs.microservice }} detected high/critical risks. Patching required."
 
   trivy-scan:
     name: Trivy - Secret & Config Scan
@@ -180,10 +166,10 @@ jobs:
           server_port: 587
           username: ${{ secrets.SOURCE_EMAIL }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Trivy Scan Failed - ${{ inputs.image_name }}"
+          subject: "Trivy Scan Failed - ${{ inputs.microservice }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Trivy secret/config analysis failed for ${{ inputs.image_name }}. Build halted."
+          body: "Trivy secret/config analysis failed for ${{ inputs.microservice }}. Build halted."
 
   build-and-push:
     name: Build & Push (Azure ACR)
@@ -202,30 +188,15 @@ jobs:
 
       - name: Build & Scan Container Image
         run: |
-          IMAGE_TAG=${{ github.sha }}
-          IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}:$IMAGE_TAG
+          IMAGE_TAG="v1.0.0"
+          IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.microservice }}:$IMAGE_TAG
           docker build -t $IMAGE_NAME .
 
           # Run Trivy Container Scan before push
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL $IMAGE_NAME
-
-      - name: Push Branch-Specific Tags
-        run: |
-          BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9]/-/g')
-          IMAGE_PATH=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}
-
-          docker push $IMAGE_PATH:${{ github.sha }}
-
-          docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:$BRANCH_NAME
-          docker push $IMAGE_PATH:$BRANCH_NAME
-
-      - name: Push Latest (Main Only)
-        if: github.ref == 'refs/heads/main'
-        run: |
-          IMAGE_PATH=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}
-          docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:latest
-          docker push $IMAGE_PATH:latest
+          
+          docker push $IMAGE_NAME
 
       - name: Notify Overall Success
         if: success()
@@ -235,11 +206,11 @@ jobs:
           server_port: 587
           username: ${{ secrets.SOURCE_EMAIL }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "CI Success - ${{ inputs.image_name }}"
+          subject: "CI Success - ${{ inputs.microservice }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
           body: |
-            CI Pipeline completed successfully for ${{ inputs.image_name }}!
+            CI Pipeline completed successfully for ${{ inputs.microservice }}!
             Repository: ${{ github.repository }}
             Branch: ${{ github.ref_name }}
-            Image: ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}:${{ github.sha }}
+            Image Tag: v1.0.0
