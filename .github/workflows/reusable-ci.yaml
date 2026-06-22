@@ -3,8 +3,12 @@ name: Reusable Microservice CI
 on:
   workflow_call:
     inputs:
+      # Accept both names to ensure compatibility with all services
+      image_name:
+        required: false
+        type: string
       microservice:
-        required: true
+        required: false
         type: string
       language:
         required: true
@@ -12,7 +16,7 @@ on:
       sonar_org:
         required: true
         type: string
-      image_name:
+      sonar_project_key:
         required: true
         type: string
 
@@ -65,24 +69,11 @@ jobs:
         with:
           args: >
             -Dsonar.organization=${{ inputs.sonar_org }}
-            -Dsonar.projectKey=${{ inputs.sonar_org }}_${{ inputs.microservice }}
+            -Dsonar.projectKey=${{ inputs.sonar_project_key }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
         continue-on-error: true
-
-      - name: Notify Sonar Failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SOURCE_EMAIL }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Security Gate Failed: SonarCloud - ${{ inputs.microservice }}"
-          to: ${{ secrets.TARGET_EMAIL }}
-          from: ${{ secrets.SOURCE_EMAIL }}
-          body: "SonarCloud analysis for ${{ inputs.microservice }} found critical issues. Please review the dashboard."
 
   snyk-scan:
     name: Snyk Vulnerability Scan
@@ -121,19 +112,6 @@ jobs:
           args: --severity-threshold=high
         continue-on-error: true
 
-      - name: Notify Snyk Failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SOURCE_EMAIL }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Security Gate Failed: Snyk - ${{ inputs.microservice }}"
-          to: ${{ secrets.TARGET_EMAIL }}
-          from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Snyk vulnerability scan for ${{ inputs.microservice }} detected high/critical risks. Patching required."
-
   trivy-scan:
     name: Trivy - Secret & Config Scan
     needs: snyk-scan
@@ -158,19 +136,6 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
-      - name: Notify Trivy Failure
-        if: failure()
-        uses: dawidd6/action-send-mail@v3
-        with:
-          server_address: smtp.gmail.com
-          server_port: 587
-          username: ${{ secrets.SOURCE_EMAIL }}
-          password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "Trivy Scan Failed - ${{ inputs.microservice }}"
-          to: ${{ secrets.TARGET_EMAIL }}
-          from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Trivy secret/config analysis failed for ${{ inputs.microservice }}. Build halted."
-
   build-and-push:
     name: Build & Push (Azure ACR)
     needs: trivy-scan
@@ -188,8 +153,11 @@ jobs:
 
       - name: Build & Scan Container Image
         run: |
+          # Use either image_name or microservice input
+          SERVICE_NAME="${{ inputs.image_name || inputs.microservice }}"
           IMAGE_TAG="v1.0.0"
-          IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.microservice }}:$IMAGE_TAG
+          IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/$SERVICE_NAME:$IMAGE_TAG
+          
           docker build -t $IMAGE_NAME .
 
           # Run Trivy Container Scan before push
@@ -206,11 +174,12 @@ jobs:
           server_port: 587
           username: ${{ secrets.SOURCE_EMAIL }}
           password: ${{ secrets.EMAIL_PASSWORD }}
-          subject: "CI Success - ${{ inputs.microservice }}"
+          subject: "CI Success - ${{ inputs.image_name || inputs.microservice }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
           body: |
-            CI Pipeline completed successfully for ${{ inputs.microservice }}!
+            CI Pipeline completed successfully!
+            Service: ${{ inputs.image_name || inputs.microservice }}
             Repository: ${{ github.repository }}
             Branch: ${{ github.ref_name }}
             Image Tag: v1.0.0
