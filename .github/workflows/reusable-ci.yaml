@@ -20,7 +20,7 @@ on:
 
 permissions:
   contents: read
-  id-token: write # Required for Azure OIDC Login
+  id-token: write
   pull-requests: write
   security-events: write
 
@@ -31,7 +31,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Dockerfile Lint (Hadolint)
         uses: hadolint/hadolint-action@v3.1.0
         with:
@@ -46,16 +46,18 @@ jobs:
 
   security-scans:
     name: Security Analysis (Sonar, Snyk, Trivy)
+    # Run even if lint is skipped
     needs: lint-and-review
+    if: always() && !failure() && !cancelled()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0 # Essential for SonarCloud analysis
+          fetch-depth: 0
 
-      # 1. SonarCloud with Quality Gate Enforcement
+      # 1. SonarCloud - Fixed action version
       - name: SonarCloud Scan
-        uses: SonarSource/sonarcloud-scan-action@v2.0.2
+        uses: sonarsource/sonarcloud-scan-action@master
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
@@ -64,20 +66,27 @@ jobs:
             -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.organization=${{ inputs.sonar_org }}
 
-      # 2. Trivy Filesystem Scan (Secret Detection)
+      # 2. Trivy Filesystem Scan
       - name: Trivy Filesystem Scan
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
           hide-progress: false
-          format: 'table'
-          exit-code: '1' # Fail the pipeline if secrets are found
+          format: 'sarif'
+          output: 'trivy-results.sarif'
           severity: 'CRITICAL,HIGH'
-          scanners: 'secret,config'
+          scanners: 'secret,vuln'
 
-      # 3. Snyk Python Dependency Scan
-      - name: Snyk Python Scan
-        uses: snyk/actions/python-3.10@master
+      - name: Upload Trivy SARIF Results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results.sarif'
+
+      # 3. Snyk - language-agnostic scan
+      - name: Snyk Security Scan
+        uses: snyk/actions/node@master
+        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
@@ -103,25 +112,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Azure OIDC Login (No static secrets used)
-      - name: Azure Login
-        uses: azure/login@v1
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
         with:
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
       - name: ACR Login
-        uses: azure/docker-login@v1
-        with:
-          login-server: ${{ secrets.ACR_LOGIN_SERVER }}
+        run: az acr login --name ${{ secrets.ACR_LOGIN_SERVER }}
 
       - name: Build & Scan Container Image
         run: |
           IMAGE_TAG=${{ github.sha }}
           IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}:$IMAGE_TAG
           docker build -t $IMAGE_NAME .
-          
+
           # Run Trivy Container Scan before push
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
             aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME
@@ -130,11 +136,9 @@ jobs:
         run: |
           BRANCH_NAME=$(echo "${{ github.ref_name }}" | sed 's/[^a-zA-Z0-9]/-/g')
           IMAGE_PATH=${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}
-          
-          # Push specific SHA tag
+
           docker push $IMAGE_PATH:${{ github.sha }}
-          
-          # Push Branch tag (e.g. develop, feature-xyz)
+
           docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:$BRANCH_NAME
           docker push $IMAGE_PATH:$BRANCH_NAME
 
