@@ -17,6 +17,10 @@ on:
         required: false
         type: boolean
         default: false
+      language:
+        required: false
+        type: string
+        default: "node"
 
 permissions:
   contents: read
@@ -98,13 +102,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 1. Setup Node.js (if applicable)
       - name: Setup Node.js
+        if: ${{ inputs.language == 'node' }}
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Snyk Security Scan
+      # 2. Setup Python (if applicable)
+      - name: Setup Python
+        if: ${{ inputs.language == 'python' }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # 3. Snyk Scan (Node)
+      - name: Snyk Node Scan
+        if: ${{ inputs.language == 'node' }}
         uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: --severity-threshold=high
+
+      # 4. Snyk Scan (Python)
+      - name: Snyk Python Scan
+        if: ${{ inputs.language == 'python' }}
+        uses: snyk/actions/python-3.10@master
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
