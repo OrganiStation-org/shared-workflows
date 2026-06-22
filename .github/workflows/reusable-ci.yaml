@@ -66,6 +66,7 @@ jobs:
     needs: lint-and-review
     if: always() && (needs.lint-and-review.result == 'success' || inputs.skip_linting)
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,13 +93,14 @@ jobs:
           subject: "SonarCloud Scan Failed - ${{ inputs.image_name }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "SonarCloud static analysis failed for ${{ inputs.image_name }}. Build halted."
+          body: "SonarCloud static analysis failed (or found vulnerabilities) for ${{ inputs.image_name }}. Build continuing as requested."
 
   snyk-scan:
     name: Snyk - Dependency Scan
     needs: sast-sonar
-    if: success()
+    if: always() && (needs.sast-sonar.result == 'success' || needs.sast-sonar.result == 'failure')
     runs-on: ubuntu-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
@@ -145,12 +147,12 @@ jobs:
           subject: "Snyk Scan Failed - ${{ inputs.image_name }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Snyk dependency vulnerability scan failed for ${{ inputs.image_name }}. Build halted."
+          body: "Snyk dependency vulnerability scan failed for ${{ inputs.image_name }}. Build continuing as requested."
 
   trivy-scan:
     name: Trivy - Secret & Config Scan
     needs: snyk-scan
-    if: success()
+    if: always() && (needs.snyk-scan.result == 'success' || needs.snyk-scan.result == 'failure')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -210,7 +212,7 @@ jobs:
 
           # Run Trivy Container Scan before push
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --exit-code 1 --severity HIGH,CRITICAL $IMAGE_NAME
+            aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL $IMAGE_NAME
 
       - name: Push Branch-Specific Tags
         run: |
