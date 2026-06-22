@@ -44,12 +44,24 @@ jobs:
         with:
           fail-on-severity: high
 
-  sast:
+      - name: Notify Lint Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Linting Failed - ${{ inputs.image_name }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "Code linting or dependency review failed for ${{ inputs.image_name }}. Build halted."
+
+  sast-sonar:
     name: SAST - SonarCloud
     needs: lint-and-review
-    if: always() && !failure() && !cancelled()
+    if: always() && (needs.lint-and-review.result == 'success' || inputs.skip_linting)
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
         with:
@@ -65,13 +77,24 @@ jobs:
             -Dsonar.projectKey=${{ inputs.sonar_project_key }}
             -Dsonar.organization=${{ inputs.sonar_org }}
 
-  snyk:
+      - name: Notify Sonar Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "SonarCloud Scan Failed - ${{ inputs.image_name }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "SonarCloud static analysis failed for ${{ inputs.image_name }}. Build halted."
+
+  snyk-scan:
     name: Snyk - Dependency Scan
-    needs: sast
-    if: always()
+    needs: sast-sonar
+    if: success()
     runs-on: ubuntu-latest
-    outputs:
-      failed: ${{ steps.snyk-scan.outcome == 'failure' && 'true' || 'false' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -81,15 +104,33 @@ jobs:
           node-version: '20'
 
       - name: Snyk Security Scan
-        id: snyk-scan
         uses: snyk/actions/node@master
-        continue-on-error: true
         env:
           SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         with:
           args: --severity-threshold=high
 
-      # Trivy Filesystem Scan (Secret Detection)
+      - name: Notify Snyk Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Snyk Scan Failed - ${{ inputs.image_name }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "Snyk dependency vulnerability scan failed for ${{ inputs.image_name }}. Build halted."
+
+  trivy-scan:
+    name: Trivy - Secret & Config Scan
+    needs: snyk-scan
+    if: success()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
       - name: Trivy Filesystem Scan
         uses: aquasecurity/trivy-action@master
         with:
@@ -106,10 +147,23 @@ jobs:
         with:
           sarif_file: 'trivy-results.sarif'
 
+      - name: Notify Trivy Failure
+        if: failure()
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 587
+          username: ${{ secrets.SOURCE_EMAIL }}
+          password: ${{ secrets.EMAIL_PASSWORD }}
+          subject: "Trivy Scan Failed - ${{ inputs.image_name }}"
+          to: ${{ secrets.TARGET_EMAIL }}
+          from: ${{ secrets.SOURCE_EMAIL }}
+          body: "Trivy secret/config analysis failed for ${{ inputs.image_name }}. Build halted."
+
   build-and-push:
     name: Build & Push (Azure ACR)
-    needs: [sast, snyk]
-    if: success() || (needs.sast.result == 'success' && needs.snyk.result == 'success')
+    needs: trivy-scan
+    if: success()
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -151,7 +205,7 @@ jobs:
           docker tag $IMAGE_PATH:${{ github.sha }} $IMAGE_PATH:latest
           docker push $IMAGE_PATH:latest
 
-      - name: Notify Success
+      - name: Notify Overall Success
         if: success()
         uses: dawidd6/action-send-mail@v3
         with:
@@ -162,4 +216,8 @@ jobs:
           subject: "CI Success - ${{ inputs.image_name }}"
           to: ${{ secrets.TARGET_EMAIL }}
           from: ${{ secrets.SOURCE_EMAIL }}
-          body: "Image ${{ inputs.image_name }} successfully pushed to ACR with tag ${{ github.sha }}."
+          body: |
+            CI Pipeline completed successfully for ${{ inputs.image_name }}!
+            Repository: ${{ github.repository }}
+            Branch: ${{ github.ref_name }}
+            Image: ${{ secrets.ACR_LOGIN_SERVER }}/${{ inputs.image_name }}:${{ github.sha }}
