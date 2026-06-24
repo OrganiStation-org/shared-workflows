@@ -2,6 +2,10 @@ name: Reusable Microservice CI
 
 on:
   workflow_call:
+    outputs:
+      image_tag:
+        description: "7-character git SHA used as the container image tag"
+        value: ${{ jobs.build-and-push.outputs.image_tag }}
     inputs:
       # Accept both names to ensure compatibility with all services
       image_name:
@@ -141,8 +145,14 @@ jobs:
     needs: trivy-scan
     if: success()
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.image_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set image tag from commit SHA
+        id: image_tag
+        run: echo "tag=${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
 
       - name: Docker Login (ACR Admin)
         uses: docker/login-action@v3
@@ -152,19 +162,20 @@ jobs:
           password: ${{ secrets.ACR_PASSWORD }}
 
       - name: Build & Scan Container Image
+        env:
+          IMAGE_TAG: ${{ steps.image_tag.outputs.tag }}
         run: |
           # Use either image_name or microservice input
           SERVICE_NAME="${{ inputs.image_name || inputs.microservice }}"
-          IMAGE_TAG="v1.0.0"
           IMAGE_NAME=${{ secrets.ACR_LOGIN_SERVER }}/$SERVICE_NAME:$IMAGE_TAG
-          
-          docker build -t $IMAGE_NAME .
+
+          docker build -t "$IMAGE_NAME" .
 
           # Run Trivy Container Scan before push
           docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-            aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL $IMAGE_NAME
-          
-          docker push $IMAGE_NAME
+            aquasec/trivy:latest image --exit-code 0 --severity HIGH,CRITICAL "$IMAGE_NAME"
+
+          docker push "$IMAGE_NAME"
 
       - name: Notify Overall Success
         if: success()
@@ -182,4 +193,4 @@ jobs:
             Service: ${{ inputs.image_name || inputs.microservice }}
             Repository: ${{ github.repository }}
             Branch: ${{ github.ref_name }}
-            Image Tag: v1.0.0
+            Image Tag: ${{ steps.image_tag.outputs.tag }}

@@ -13,6 +13,7 @@ By referencing this file, every microservice automatically benefits from:
 1.  **Consolidated Logic**: One fix here updates all microservices instantly.
 2.  **Standardized Security**: Every build must pass the exact same quality gates.
 3.  **Audit Trail**: Centralized logging for organization-wide compliance.
+4.  **Immutable Tags**: Images are pushed to ACR with the first 7 characters of the commit SHA (e.g. `a1b2c3d`), not a static version.
 
 ---
 
@@ -33,12 +34,22 @@ By referencing this file, every microservice automatically benefits from:
 Add this file to your microservice at `.github/workflows/build.yaml`:
 
 ```yaml
-uses: OrganiStation-org/shared-workflows/.github/workflows/reusable-ci.yaml@develop
-with:
-  image_name: your-service-name
-  sonar_project_key: your-project-key
-  skip_linting: false # Set to true only during legacy migrations
-secrets: inherit
+jobs:
+  ci:
+    uses: OrganiStation-org/shared-workflows/.github/workflows/reusable-ci.yaml@develop
+    with:
+      image_name: your-service-name
+      language: node
+      sonar_org: your-sonar-org
+      sonar_project_key: your-project-key
+    secrets: inherit
+
+  # Optional: read the SHA tag pushed to ACR
+  deploy-hint:
+    needs: ci
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Deployed image tag ${{ needs.ci.outputs.image_tag }}"
 ```
 
 ---
